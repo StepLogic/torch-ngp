@@ -595,12 +595,12 @@ class Trainer(object):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         H, W = data['H'], data['W']
-
+        # print(H,W)
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
-
+        # breakpoint()
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
 
@@ -780,6 +780,7 @@ class Trainer(object):
     def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
         
         # render resolution (may need downscale to for better frame rate)
+        breakpoint()
         rH = int(H * downscale)
         rW = int(W * downscale)
         intrinsics = intrinsics * downscale
@@ -1026,6 +1027,8 @@ class Trainer(object):
         if self.model.cuda_ray:
             state['mean_count'] = self.model.mean_count
             state['mean_density'] = self.model.mean_density
+            state['density_bitfield'] = self.model.density_bitfield
+            # state['mean_density'] = self.model.mean_density
 
         if full:
             state['optimizer'] = self.optimizer.state_dict()
@@ -1102,10 +1105,13 @@ class Trainer(object):
             self.ema.load_state_dict(checkpoint_dict['ema'])
 
         if self.model.cuda_ray:
+            # breakpoint()
             if 'mean_count' in checkpoint_dict:
                 self.model.mean_count = checkpoint_dict['mean_count']
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
+            if "density_bitfield" in checkpoint_dict:
+                self.model.density_bitfield = checkpoint_dict['density_bitfield']
         
         if model_only:
             return

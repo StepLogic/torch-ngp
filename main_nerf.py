@@ -24,7 +24,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
     parser.add_argument('--ckpt', type=str, default='latest')
     parser.add_argument('--num_rays', type=int, default=4096, help="num rays sampled per image for each training step")
-    parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
+    parser.add_argument('--cuda_ray', action='store_false', help="use CUDA raymarching instead of pytorch")
     parser.add_argument('--max_steps', type=int, default=1024, help="max num steps sampled per ray (only valid when using --cuda_ray)")
     parser.add_argument('--num_steps', type=int, default=512, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--upsample_steps', type=int, default=0, help="num steps up-sampled per ray (only valid when NOT using --cuda_ray)")

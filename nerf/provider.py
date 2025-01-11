@@ -114,11 +114,11 @@ class NeRFDataset:
         # auto-detect transforms.json and split mode.
         if os.path.exists(os.path.join(self.root_path, 'transforms.json')):
             self.mode = 'colmap' # manually split, use view-interpolation for test.
-        elif os.path.exists(os.path.join(self.root_path, 'transforms_train.json')):
+        elif os.path.exists(os.path.join(self.root_path, 'transforms_train.json')) or os.path.exists(os.path.join(self.root_path, 'transforms_blend.json')):
             self.mode = 'blender' # provided split
         else:
             raise NotImplementedError(f'[NeRFDataset] Cannot find transforms*.json under {self.root_path}')
-
+        
         # load nerf-compatible format data.
         if self.mode == 'colmap':
             with open(os.path.join(self.root_path, 'transforms.json'), 'r') as f:
@@ -143,6 +143,9 @@ class NeRFDataset:
                     transform_val = json.load(f)
                 transform['frames'].extend(transform_val['frames'])
             # only load one specified split
+            # elif type =="train":
+            #     with open(os.path.join(self.root_path, 'transforms_blend.json'), 'r') as f:
+            #             transform = json.load(f)
             else:
                 with open(os.path.join(self.root_path, f'transforms_{type}.json'), 'r') as f:
                     transform = json.load(f)
@@ -196,9 +199,12 @@ class NeRFDataset:
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
-
+                if not (".png" in  os.path.basename(f_path) or ".jpg" in  os.path.basename(f_path)):
+                    f_path += '.png' # so silly...
                 # there are non-exist paths in fox...
+                
                 if not os.path.exists(f_path):
+                    breakpoint()
                     continue
                 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
@@ -221,6 +227,7 @@ class NeRFDataset:
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
                 self.poses.append(pose)
+                # print(len(self.poses))
                 self.images.append(image)
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]

@@ -83,6 +83,7 @@ class NeRFRenderer(nn.Module):
         aabb_infer = aabb_train.clone()
         self.register_buffer('aabb_train', aabb_train)
         self.register_buffer('aabb_infer', aabb_infer)
+        
 
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
@@ -166,7 +167,7 @@ class NeRFRenderer(nn.Module):
         #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
         for k, v in density_outputs.items():
             density_outputs[k] = v.view(N, num_steps, -1)
-
+   
         # upsample z_vals (nerf-like)
         if upsample_steps > 0:
             with torch.no_grad():
@@ -201,7 +202,8 @@ class NeRFRenderer(nn.Module):
             for k in density_outputs:
                 tmp_output = torch.cat([density_outputs[k], new_density_outputs[k]], dim=1)
                 density_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
-
+        densities = density_outputs['sigma']
+            
         deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
         deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
         alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
@@ -250,13 +252,112 @@ class NeRFRenderer(nn.Module):
             'depth': depth,
             'image': image,
             'weights_sum': weights_sum,
+            'densities': densities,
+            "rgbs":rgbs
         }
 
+
+    def get_raw_values(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
+        # rays_o, rays_d: [B, N, 3], assumes B == 1
+        rays_o = rays_o.contiguous().view(-1, 3)
+        rays_d = rays_d.contiguous().view(-1, 3)
+        N = rays_o.shape[0]
+        device = rays_o.device
+
+        # pre-calculate near far
+        nears, fars = raymarching.near_far_from_aabb(
+            rays_o, rays_d, 
+            self.aabb_train if self.training else self.aabb_infer,
+            self.min_near
+        )
+
+        # mix background color
+        if self.bg_radius > 0:
+            sph = raymarching.sph_from_ray(rays_o, rays_d, self.bg_radius)
+            bg_color = self.background(sph, rays_d)
+        elif bg_color is None:
+            bg_color = 1
+
+        # Counter setup for step tracking
+        if hasattr(self, 'step_counter') and hasattr(self, 'local_step'):
+            counter = self.step_counter[self.local_step % 16]
+            counter.zero_()
+            self.local_step += 1
+        
+        # Initialize output tensors
+        dtype = torch.float32
+        weights_sum = torch.zeros(N, dtype=dtype, device=device)
+        depth = torch.zeros(N, dtype=dtype, device=device)
+        image = torch.zeros(N, 3, dtype=dtype, device=device)
+        
+        # Initialize ray marching variables
+        n_alive = N
+        rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device)
+        rays_t = nears.clone()
+        
+        # Storage for all densities and colors
+        all_sigmas = []
+        all_rgbs = []
+        
+        # Ray marching loop
+        step = 0
+        while step < max_steps:
+            n_alive = rays_alive.shape[0]
+            if n_alive <= 0:
+                break
+                
+            # Decide number of steps
+            n_step = max(min(N // n_alive, 8), 1)
+            
+            # March rays
+            xyzs, dirs, deltas = raymarching.march_rays(
+                n_alive, n_step,
+                rays_alive, rays_t,
+                rays_o, rays_d,
+                self.bound,
+                self.density_bitfield,
+                self.cascade,
+                self.grid_size,
+                nears, fars,
+                128, 
+                perturb if step == 0 else False,
+                dt_gamma, max_steps
+            )
+            
+            # Get sigmas and colors
+            sigmas, rgbs = self(xyzs, dirs)
+            all_sigmas.append(sigmas)
+            all_rgbs.append(rgbs)
+            
+            # Update alive rays
+            rays_alive = rays_alive[rays_alive >= 0]
+            step += n_step
+            
+            # Clean up
+            del xyzs, dirs, deltas
+        
+        # Combine all samples
+        if len(all_sigmas) > 0:
+            sigmas = torch.cat(all_sigmas, dim=0)
+            rgbs = torch.cat(all_rgbs, dim=0)
+        else:
+            sigmas = torch.zeros((0,), device=device)
+            rgbs = torch.zeros((0, 3), device=device)
+        
+        results = {
+            "densities": sigmas,
+            "rgbs": rgbs
+        }
+        
+        # Clean up
+        del all_sigmas, all_rgbs
+        
+        return results
 
     def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: image: [B, N, 3], depth: [B, N]
-
+        # breakpoint()
         prefix = rays_o.shape[:-1]
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
@@ -288,6 +389,9 @@ class NeRFRenderer(nn.Module):
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
             
             sigmas, rgbs = self(xyzs, dirs)
+            densities=sigmas
+            # pure_rgbs= rgbs.view(N, -1, 3) # [N, T+t, 3]
+
             # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
@@ -351,29 +455,23 @@ class NeRFRenderer(nn.Module):
                 n_step = max(min(N // n_alive, 8), 1)
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
-
                 sigmas, rgbs = self(xyzs, dirs)
-                # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
-                # sigmas = density_outputs['sigma']
-                # rgbs = self.color(xyzs, dirs, **density_outputs)
+                densities=sigmas
                 sigmas = self.density_scale * sigmas
-
                 raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
-
                 rays_alive = rays_alive[rays_alive >= 0]
-
-                #print(f'step = {step}, n_step = {n_step}, n_alive = {n_alive}, xyzs: {xyzs.shape}')
-
                 step += n_step
 
-            image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+            image = image + (1 - weights_sum).unsqueeze(-1)
             depth = torch.clamp(depth - nears, min=0) / (fars - nears)
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)
         
         results['depth'] = depth
         results['image'] = image
-
+        results["densities"]=densities
+        results["rgbs"]=rgbs
+        # breakpoint()
         return results
 
     @torch.no_grad()
@@ -554,7 +652,19 @@ class NeRFRenderer(nn.Module):
         if staged and not self.cuda_ray:
             depth = torch.empty((B, N), device=device)
             image = torch.empty((B, N, 3), device=device)
-
+            T = kwargs['num_steps'] + kwargs['upsample_steps']
+            densities = torch.empty((B, N, T), device=device)
+            rgbs = torch.empty((B, N, T, 3), device=device)
+            # for b in range(B):
+            #     head = 0
+            #     while head < N:
+            #         tail = min(head + max_ray_batch, N)
+            #         results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
+            #         depth[b:b+1, head:tail] = results_['depth']
+            #         image[b:b+1, head:tail] = results_['image']
+            #         densities[b:b+1, head:tail]=results_["densities"].reshape(1,abs(head-tail),T)
+            #         rgbs[b:b+1, head:tail]=results_["rgbs"].reshape(1,abs(head-tail),T)
+            #         head += max_ray_batch
             for b in range(B):
                 head = 0
                 while head < N:
@@ -562,11 +672,15 @@ class NeRFRenderer(nn.Module):
                     results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
                     depth[b:b+1, head:tail] = results_['depth']
                     image[b:b+1, head:tail] = results_['image']
+                    densities[b:b+1, head:tail] = results_['densities'].permute(2,0,1)
+                    rgbs[b:b+1, head:tail] = results_['rgbs']
                     head += max_ray_batch
             
             results = {}
             results['depth'] = depth
             results['image'] = image
+            results['densities'] = densities
+            results['rgbs'] = rgbs
 
         else:
             results = _run(rays_o, rays_d, **kwargs)

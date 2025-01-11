@@ -62,7 +62,7 @@ class NeRFGUI:
         self.bg_color = torch.ones(3, dtype=torch.float32) # default white bg
         self.training = False
         self.step = 0 # training step 
-
+        self.wipe_buffer=False
         self.trainer = trainer
         self.train_loader = train_loader
         if train_loader is not None:
@@ -76,7 +76,7 @@ class NeRFGUI:
         self.dynamic_resolution = True
         self.downscale = 1
         self.train_steps = 16
-
+        self.scene_editing_fixed_pose=None
         dpg.create_context()
         self.register_dpg()
         self.test_step()
@@ -120,7 +120,7 @@ class NeRFGUI:
     def test_step(self):
         # TODO: seems we have to move data from GPU --> CPU --> GPU?
 
-        if self.need_update or self.spp < self.opt.max_spp:
+        if (self.need_update or self.spp < self.opt.max_spp) and len(self.trainer.scene_composition)<len(self.trainer.models):
         
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             starter.record()
@@ -132,7 +132,7 @@ class NeRFGUI:
             t = starter.elapsed_time(ender)
 
             # update dynamic resolution
-            if self.dynamic_resolution:
+            if self.dynamic_resolution and len(self.trainer.scene_editing["static_objects"])==0:
                 # max allowed infer time per-frame is 200 ms
                 full_t = t / (self.downscale ** 2)
                 downscale = min(1, max(1/4, math.sqrt(200 / full_t)))
@@ -146,11 +146,19 @@ class NeRFGUI:
             else:
                 self.render_buffer = (self.render_buffer * self.spp + self.prepare_buffer(outputs)) / (self.spp + 1)
                 self.spp += 1
+           
 
             dpg.set_value("_log_infer_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
             dpg.set_value("_log_resolution", f'{int(self.downscale * self.W)}x{int(self.downscale * self.H)}')
             dpg.set_value("_log_spp", self.spp)
             dpg.set_value("_texture", self.render_buffer)
+        if self.wipe_buffer:
+            self.wipe_buffer=False
+            self.render_buffer = np.ones((self.H, self.W, 3), dtype=np.float32)
+            self.spp = 1
+            dpg.set_value("_texture", self.render_buffer)
+            
+        
 
         
     def register_dpg(self):
@@ -198,7 +206,7 @@ class NeRFGUI:
 
             # train button
             if not self.opt.test:
-                with dpg.collapsing_header(label="Train", default_open=True):
+                with dpg.collapsing_header(label="Train", default_open=False):
 
                     # train / stop
                     with dpg.group(horizontal=True):
@@ -259,21 +267,37 @@ class NeRFGUI:
                     with dpg.group(horizontal=True):
                         dpg.add_text("", tag="_log_train_log")
 
-            # with dpg.collapsing_header(label="Compositioning", default_open=True):
-            #     with dpg.group(horizontal=True):
-            #         def callback_edit_s(sender, app_data):
-            #             if self.dynamic_resolution:
-            #                 self.dynamic_resolution = False
-            #                 self.downscale = 1
-            #             else:
-            #                 self.dynamic_resolution = True
-            #             self.need_update = True
+            with dpg.collapsing_header(label="Scene Composition", default_open=True):
+                for k in self.trainer.models:
+                    with dpg.group(horizontal=True):
+                        def callback_compose_scene(sender, app_data):
+                            if not app_data:
+                                self.trainer.scene_composition.append(sender)
+                            else:
+                                self.trainer.scene_composition.pop(self.trainer.scene_composition.index(sender))
+                            self.need_update = True
+                            self.wipe_buffer = not app_data
+                        dpg.add_checkbox(label=f"Enable {k}",tag=k, default_value=True, callback=callback_compose_scene)
 
-            #         dpg.add_checkbox(label="dynamic resolution", default_value=self.dynamic_resolution, callback=callback_set_dynamic_resolution)
-            #         dpg.add_text(f"{self.W}x{self.H}", tag="_log_resolution")
+            with dpg.collapsing_header(label="Scene Editing", default_open=True):
+                for k in self.trainer.models:
+                    with dpg.group(horizontal=True):
+                        def callback_edit_scene(sender, app_data):
+                            # print(sender,app_data)
+                            sender=sender.split("-")[-1]
+                            if not app_data:
+                                self.trainer.scene_editing["static_objects"].append(sender)
+                            else:
+                                self.trainer.scene_editing["static_objects"].pop(self.trainer.scene_editing["static_objects"].index(sender))
+                            # print(self.trainer.exclude_update,sender)
+                                # print(sender,app_data)
+                            self.need_update = True
+                            self.spp=1
+                        dpg.add_checkbox(label=f"Enable {k}",tag=f"edit-{k}", default_value=True, callback=callback_edit_scene)
+                        # dpg.add_text(f"Obejct {k}", tag=f"object_{k}")
 
             # rendering options
-            with dpg.collapsing_header(label="Options", default_open=True):
+            with dpg.collapsing_header(label="Options", default_open=False):
 
                 # dynamic rendering resolution
                 with dpg.group(horizontal=True):

@@ -15,3 +15,8 @@ dnerf/network_basis_perpoint.py
 
 **neus*
 neus/
+laptop_nerf/*
+lego_nerf/*
+cup_nerf/*
+trial_nerf/*
+data/*
